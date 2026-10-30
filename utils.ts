@@ -38,6 +38,6 @@ export function convertSnakeCaseToCamelCase(obj: any): any {
     }, {} as any);
 };
 
-const logger = new Logger("Stalker");
+const logger = new Logger("Oshify");
 
 export { logger };

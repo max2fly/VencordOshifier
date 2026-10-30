@@ -1,7 +1,7 @@
-import { addContextMenuPatch, NavContextMenuPatchCallback, removeContextMenuPatch } from "@api/ContextMenu";
+import { NavContextMenuPatchCallback } from "@api/ContextMenu";
 import { definePluginSettings } from "@api/Settings";
 import definePlugin, { OptionType, PluginDef } from "@utils/types";
-import { Menu, Toasts, UserStore, MessageStore, RestAPI, ChannelStore } from "@webpack/common";
+import { Menu, showToast, UserStore, MessageStore, RestAPI, ChannelStore } from "@webpack/common";
 import { findByProps } from "@webpack";
 import { getCurrentChannel, openUserProfile } from "@utils/discord";
 import { Notifications } from "@api/index";
@@ -30,7 +30,7 @@ const settings = definePluginSettings({
     whitelistedIds: {
         default: "",
         type: OptionType.STRING,
-        description: "Whitelisted user IDs to stalk"
+        description: "Whitelisted oshi IDs"
     },
     trackUserProfileChanges: {
         default: true,
@@ -56,9 +56,28 @@ const settings = definePluginSettings({
         default: 100,
         type: OptionType.NUMBER,
         description: "Character limit for notifications. Set to 0 for no limit. Default=100"
+    },
+    botEndpoint: {
+        default: "http://localhost:7890/notify",
+        type: OptionType.STRING,
+        description: "HTTP endpoint for forwarding notifications to the Discord bot"
+    },
+    forwardToBot: {
+        default: false,
+        type: OptionType.BOOLEAN,
+        description: "Forward notification events to the bot via HTTP (requires a bot listening on the above port)"
     }
 });
 
+function sendToBot(eventType: string, data: Record<string, string>) {
+    if (!settings.store.forwardToBot || !settings.store.botEndpoint) return;
+    const payload = { event_type: eventType, ...data };
+    fetch(settings.store.botEndpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    }).catch(() => {}); // fire-and-forget, suppress errors
+}
 
 const switchToMsg = (gid: string, cid?: string, mid?: string) => {
     if (gid) findByProps("transitionToGuildSync").transitionToGuildSync(gid);
@@ -87,17 +106,43 @@ let oldUsers: {
 } = {};
 let loggedMessages: Record<string, Message> = {};
 
+const contextMenuPatch: NavContextMenuPatchCallback = (children, props) => {
+    if (!props || props?.user?.id === UserStore.getCurrentUser().id) return;
+
+    if (!children.some(child => child?.props?.id === "oshifier-v1")) {
+        children.push(
+            <Menu.MenuSeparator />,
+            <Menu.MenuItem
+                id="oshifier-v1"
+                label={isInWhitelist(props.user.id) ? "Stop Oshifying User" : "Oshifying User"}
+                action={() =>
+                    isInWhitelist(props.user.id)
+                        ? _plugin.unOshiuser(props.user.id)
+                        : _plugin.oshiUser(props.user.id)
+                }
+            />
+        );
+    }
+};
+
 const _plugin: PluginDef & Record<string, any> = {
-    name: "Stalker",
-    description: "This plugin allows you to stalk users, made for delusional people like myself.",
+    name: "Oshifier",
+    description: "This plugin allows you to oshi your favorite streamer, so you dont miss any announcements!",
     authors: [
         {
             id: 253302259696271360n,
             name: "zastix",
         },
+        {
+            id: 236950175480807424n,
+            name: "max2fly",
+        }
     ],
     dependencies: ["MessageLoggerEnhanced"],
     settings,
+    contextMenus: {
+        "user-context": contextMenuPatch
+    },
     flux: {
         MESSAGE_CREATE: (payload: MessageCreatePayload) => {
             if (!payload.message || !payload.message.author || !payload.message.channel_id || !settings.store.trackSentMessage) return;
@@ -109,19 +154,35 @@ const _plugin: PluginDef & Record<string, any> = {
             if (payload.message.type === 7) {
                 Notifications.showNotification({
                     // @ts-ignore outdated types lib doesnt have .globalName
-                    title: `${author.globalName || author.username} Joined a server`,
+                    title: `${author.globalName || author.username} Joined a server ` + ChannelStore.getChannel(payload.guildID).name,
                     body: "Click to jump to the message.",
                     onClick: () => switchToMsg(payload.guildId, payload.channelId, payload.message.id),
                     icon: author.getAvatarURL(undefined, undefined, false)
+                });
+                sendToBot("MESSAGE_CREATE", {
+                    guild_id: payload.guildId,
+                    channel_id: payload.channelId,
+                    channel_name: ChannelStore.getChannel(payload.channelId)?.name ?? "",
+                    user: author.globalName || author.username,
+                    content: "Joined the server",
+                    message_id: payload.message.id,
                 });
                 return;
             }
             Notifications.showNotification({
                 // @ts-ignore outdated types lib doesnt have .globalName
-                title: `${author.globalName || author.username} Sent a message`,
+                title: `${author.globalName || author.username} Sent a message in ` + ChannelStore.getChannel(payload.channelId).name,
                 body: getMessageBody(settings, payload),
                 onClick: () => switchToMsg(payload.guildId, payload.channelId, payload.message.id),
                 icon: author.getAvatarURL(undefined, undefined, false)
+            });
+            sendToBot("MESSAGE_CREATE", {
+                guild_id: payload.guildId,
+                channel_id: payload.channelId,
+                channel_name: ChannelStore.getChannel(payload.channelId)?.name ?? "",
+                user: author.globalName || author.username,
+                content: payload.message.content || "",
+                message_id: payload.message.id,
             });
         },
         MESSAGE_UPDATE: (payload: MessageUpdatePayload) => {
@@ -133,21 +194,39 @@ const _plugin: PluginDef & Record<string, any> = {
 
             Notifications.showNotification({
                 // @ts-ignore outdated types lib doesnt have .globalName
-                title: `${author.globalName || author.username} Edited a message`,
+                title: `${author.globalName || author.username} Edited a message` + ChannelStore.getChannel(payload.channelId).name,
                 body: getMessageBody(settings, payload),
                 onClick: () => switchToMsg(payload.guildId, payload.message.channel_id, payload.message.id),
                 icon: author.getAvatarURL(undefined, undefined, false)
             });
+            sendToBot("MESSAGE_UPDATE", {
+                guild_id: payload.guildId,
+                channel_id: payload.message.channel_id,
+                channel_name: ChannelStore.getChannel(payload.channelId)?.name ?? "",
+                user: author.globalName || author.username,
+                content: payload.message.content || "",
+                message_id: payload.message.id,
+            });
         },
         MESSAGE_DELETE: async (payload: MessageDeletePayload) => {
             if (!payload || !payload?.channelId || !payload?.id || !payload?.guildId) return;
-            let message: Message | null;
-            if (loggedMessages[payload.id]) {
-                message = MessageStore.getMessage(payload.channelId, payload.id) ?? loggedMessages[payload.id];
-            } else {
-                loggedMessages = await importLoggedMessages();
-                message = MessageStore.getMessage(payload.channelId, payload.id) ?? loggedMessages[payload.id];
+            // ensure loggedMessages is at least an object
+            if (!loggedMessages) loggedMessages = {};
+
+            // try to find it in cache first
+            let message: Message | null = MessageStore.getMessage(payload.channelId, payload.id)
+                                        ?? loggedMessages[payload.id]
+                                        ?? null;
+
+            // if it wasn’t already in our local cache, re-import once
+            if (!message) {
+                const imported = await importLoggedMessages();
+                loggedMessages = imported ?? {};
+                message = MessageStore.getMessage(payload.channelId, payload.id)
+                        ?? loggedMessages[payload.id]
+                        ?? null;
             }
+
             if (!message) return logger.error("Received a MESSAGE_DELETE event but the message was not found in the MessageStore, try enabling \"Cache Messages From Servers\" setting in MessageLoggerEnhanced.");
 
             const { author } = message;
@@ -155,7 +234,7 @@ const _plugin: PluginDef & Record<string, any> = {
 
             Notifications.showNotification({
                 // @ts-ignore outdated types lib doesnt have .globalName
-                title: `${author.globalName || author.username} Deleted a message!`,
+                title: `${author.globalName || author.username} Deleted a message in` + ChannelStore.getChannel(payload.channelId).name,
                 body: `"${message.content.length > 100 ? message.content.substring(0, 100).concat("...") : message.content}"`,
                 onClick: () => {
                     findByProps("selectChannel").selectChannel({
@@ -166,6 +245,14 @@ const _plugin: PluginDef & Record<string, any> = {
                 },
                 icon: author.getAvatarURL(undefined, undefined, false)
             });
+            sendToBot("MESSAGE_DELETE", {
+                guild_id: payload.guildId,
+                channel_id: payload.channelId,
+                channel_name: ChannelStore.getChannel(payload.channelId)?.name ?? "",
+                user: author.globalName || author.username,
+                content: message.content || "",
+                message_id: payload.id,
+            });
         },
         TYPING_START: (payload: TypingStartPayload) => {
             if (!payload || !payload.channelId || !payload.userId || !settings.store.trackStartedTyping) return;
@@ -175,10 +262,17 @@ const _plugin: PluginDef & Record<string, any> = {
 
             Notifications.showNotification({
                 // @ts-ignore outdated types lib doesnt have .globalName
-                title: `${author.globalName || author.username} Started typing...`,
-                body: "Click to jump to the channel.",
+                title: `${author.globalName || author.username} Started typing in ` + ChannelStore.getChannel(payload.channelId).name,
+                body: "Click to jump to the channel. ",
                 icon: author.getAvatarURL(undefined, undefined, false),
                 onClick: () => switchToMsg(ChannelStore.getChannel(payload.channelId).guild_id, payload.channelId)
+            });
+            const typingChannel = ChannelStore.getChannel(payload.channelId);
+            sendToBot("TYPING_START", {
+                guild_id: typingChannel?.guild_id ?? "",
+                channel_id: payload.channelId,
+                channel_name: typingChannel?.name ?? "",
+                user: author.globalName || author.username,
             });
 
         },
@@ -228,18 +322,31 @@ const _plugin: PluginDef & Record<string, any> = {
 
             // Update cached user for next time
             oldUsers[payload.user.id] = payload;
+
+            sendToBot("PROFILE_UPDATE", {
+                user: notificationTitle,
+                changes: changedPropertiesList,
+            });
         },
 
         THREAD_CREATE: (payload: ThreadCreatePayload) => {
             if (!payload || !payload.channel || !payload.channel.id || !payload.channel.ownerId || !isInWhitelist(payload.channel.ownerId)) return;
 
             if (payload.isNewlyCreated) {
+                const threadOwner = UserStore.getUser(payload.channel.ownerId);
+                const parentChannel = ChannelStore.getChannel(payload.channel.parent_id);
                 Notifications.showNotification({
                     // @ts-ignore outdated types lib doesnt have .globalName
-                    title: `New thread created by ${UserStore.getUser(payload.channel.ownerId).globalName || UserStore.getUser(payload.channel.ownerId).username}`,
+                    title: `New thread created by ${threadOwner.globalName || threadOwner.username} in ${parentChannel.name}`,
                     body: `Click to view the thread.`,
                     onClick: () => switchToMsg(payload.channel.guild_id, payload.channel.parent_id),
-                    icon: UserStore.getUser(payload.channel.ownerId).getAvatarURL(undefined, undefined, false)
+                    icon: threadOwner.getAvatarURL(undefined, undefined, false)
+                });
+                sendToBot("THREAD_CREATE", {
+                    guild_id: payload.channel.guild_id,
+                    channel_id: payload.channel.id,
+                    channel_name: parentChannel?.name ?? "",
+                    user: threadOwner.globalName || threadOwner.username,
                 });
             }
         },
@@ -247,7 +354,7 @@ const _plugin: PluginDef & Record<string, any> = {
     async start() {
         if (!Vencord.Plugins.plugins["MessageLoggerEnhanced"]) {
             Notifications.showNotification({
-                title: "Stalker plugin requires MessageLoggerEnhanced to be enabled",
+                title: "Oshifier plugin requires MessageLoggerEnhanced to be enabled",
                 body: "Click to download it.",
                 onClick: () => open("https://github.com/Syncxv/vc-message-logger-enhanced/")
             });
@@ -264,19 +371,19 @@ const _plugin: PluginDef & Record<string, any> = {
             oldUsers[id] = body;
             logger.info(`Cached user ${id} with name ${oldUsers[id].user.globalName || oldUsers[id].user.username} for further usage.`);
         }
-        addContextMenuPatch("user-context", contextMenuPatch);
 
         this.loggedMessages = await importLoggedMessages();
+        const imported = await importLoggedMessages();
+        loggedMessages = imported ?? {};
     },
     stop() {
-        removeContextMenuPatch("user-context", contextMenuPatch);
+        // No need to manually remove context menus; Vencord handles this automatically.
     },
-    async stalkUser(id: string) {
-        Toasts.show({
-            type: Toasts.Type.SUCCESS,
+    async oshiUser(id: string) {
+        showToast({
+            variant: "success",
             // @ts-ignore outdated types lib doesnt have .globalName
-            message: `Stalking ${UserStore.getUser(id).globalName || UserStore.getUser(id).username}`,
-            id: Toasts.genId()
+            text: `Oshiing ${UserStore.getUser(id).globalName || UserStore.getUser(id).username}`
         });
         addToWhitelist(id);
         const { body } = await RestAPI.get({
@@ -289,30 +396,14 @@ const _plugin: PluginDef & Record<string, any> = {
         oldUsers[id] = convertSnakeCaseToCamelCase(body);
         logger.info(`Cached user ${id} with name ${oldUsers[id].user.globalName || oldUsers[id].user.username} for further usage.`);
     },
-    unStalkuser(id: string) {
-        Toasts.show({
-            type: Toasts.Type.SUCCESS,
+    unOshiuser(id: string) {
+        showToast({
+            variant: "success",
             // @ts-ignore outdated types lib doesnt have .globalName
-            message: `Stopped stalking ${UserStore.getUser(id).globalName || UserStore.getUser(id).username}`,
-            id: Toasts.genId()
+            text: `Stopped Oshiing ${UserStore.getUser(id).globalName || UserStore.getUser(id).username}`
         });
         removeFromWhitelist(id);
         delete oldUsers[id];
-    }
-};
-
-const contextMenuPatch: NavContextMenuPatchCallback = (children, props) => {
-    if (!props || props?.user?.id === UserStore.getCurrentUser().id) return;
-
-    if (!children.some(child => child?.props?.id === "stalker-v1")) {
-        children.push(
-            <Menu.MenuSeparator />,
-
-            <Menu.MenuItem
-                id="stalker-v1"
-                label={isInWhitelist(props.user.id) ? "Stop Stalking User" : "Stalk User"}
-                action={() => isInWhitelist(props.user.id) ? _plugin.unStalkuser(props.user.id) : _plugin.stalkUser(props.user.id)} />
-        );
     }
 };
 

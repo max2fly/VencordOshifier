@@ -62,3 +62,4 @@ export type subscribedEvents =
     | "THREAD_CREATE"
     | "TYPING_START"
     | "USER_UPDATE";
+
